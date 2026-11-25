@@ -1,0 +1,84 @@
+name: Release
+
+# master에 push되면 manifest.json의 버전을 확인하고,
+# 해당 버전의 태그(v<버전>)가 아직 없으면 릴리스를 발행합니다.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from manifest.json
+        id: version
+        run: |
+          VERSION=$(jq -r '.version' manifest.json)
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "::error::manifest.json에서 version을 읽지 못했습니다."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether the tag already exists
+        id: check
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.version.outputs.tag }}" > /dev/null; then
+            echo "${{ steps.version.outputs.tag }} 태그가 이미 있어 릴리스를 건너뜁니다."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package extension
+        if: steps.check.outputs.exists == 'false'
+        id: package
+        run: |
+          ZIP="iCampusCheck-${{ steps.version.outputs.tag }}.zip"
+          # 확장 실행에 필요 없는 파일은 제외
+          zip -r "$ZIP" . \
+            -x ".git/*" ".github/*" "images/*" "node_modules/*" "web-ext-artifacts/*" \
+               "*.md" "package.json" "pnpm-lock.yaml" ".gitignore" ".prettierrc" ".prettierignore"
+          unzip -l "$ZIP"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Build release notes from README
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          # README 버전 히스토리의 "- **<버전>**" 아래 "> ..." 줄들을 추출
+          awk -v ver="${{ steps.version.outputs.version }}" '
+            index($0, "- **" ver "**") == 1 { found = 1; next }
+            found && /^ *>/ { sub(/^ *> ?/, "- "); sub(/ +$/, ""); print; next }
+            found { exit }
+          ' README.md > notes.md
+
+          cat >> notes.md <<'EOF'
+
+          ## 설치 방법 (압축 파일로 직접 설치)
+          1. 아래 Assets의 `.zip` 파일을 내려받아 압축을 풉니다.
+          2. 크롬에서 `chrome://extensions`로 이동해 오른쪽 위 **개발자 모드**를 켭니다.
+          3. **압축해제된 확장 프로그램을 로드합니다**를 누르고 압축을 푼 폴더를 선택합니다.
+          EOF
+          cat notes.md
+
+      - name: Create release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            "${{ steps.package.outputs.zip }}" \
+            --target "${{ github.sha }}" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --notes-file notes.md

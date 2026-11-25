@@ -27,25 +27,57 @@ function sortByRemainingTime(items) {
  * Canvas API에서 사용자의 즐겨찾기 과목 목록을 가져옵니다.
  */
 async function getCourses() {
-  const url = "https://canvas.skku.edu/api/v1/users/self/favorites/courses";
+  return fetchAllPages(
+    "https://canvas.skku.edu/api/v1/users/self/favorites/courses?per_page=100",
+  );
+}
+
+/**
+ * Canvas API의 목록을 모든 페이지에 걸쳐 가져옵니다.
+ */
+async function fetchAllPages(url) {
+  const items = [];
 
   try {
-    const response = await fetch(url, {
-      method: "GET",
-      credentials: "include",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      // 요청 시간 제한
-      signal: AbortSignal.timeout(5000),
-    });
+    // Link 헤더의 rel="next"를 따라가며 모든 페이지를 가져옴
+    while (url) {
+      const response = await fetch(url, {
+        method: "GET",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        // 요청 시간 제한
+        signal: AbortSignal.timeout(5000),
+      });
 
-    let text = await response.text();
-    text = text.replace(/^while\(1\);/, "");
-    return JSON.parse(text);
+      if (!response.ok) break;
+
+      let text = await response.text();
+      text = text.replace(/^while\(1\);/, "");
+      const page = JSON.parse(text);
+      if (!Array.isArray(page)) break;
+
+      items.push(...page);
+      url = getNextPageUrl(response.headers.get("Link"));
+    }
+    return items;
   } catch (error) {
-    return [];
+    // 일부 페이지만 받은 경우에도 받은 만큼은 사용
+    return items;
   }
+}
+
+/**
+ * Canvas API의 Link 헤더에서 다음 페이지 URL을 추출합니다.
+ */
+function getNextPageUrl(linkHeader) {
+  if (!linkHeader) return null;
+  const next = linkHeader
+    .split(",")
+    .find((part) => part.includes('rel="next"'));
+  const match = next && next.match(/<([^>]+)>/);
+  return match ? match[1] : null;
 }
 
 /**
@@ -55,7 +87,8 @@ async function getCourseModules(courseId, courseName) {
   const authorizationToken = "Bearer " + getCookie("xn_api_token");
   const url = `https://canvas.skku.edu/learningx/api/v1/courses/${courseId}/modules`;
   const now = new Date();
-  const result = { lecture: [], assignment: [] };
+  // assignmentKeys: 모듈에 있는 과제 (완료 여부 무관, "과제 및 평가"와의 중복 제거용)
+  const result = { lecture: [], assignment: [], assignmentKeys: new Set() };
 
   try {
     const response = await fetch(url, {
@@ -81,6 +114,17 @@ async function getCourseModules(courseId, courseName) {
 
         // 항목 처리 최적화: Promise.all 사용하여 병렬 처리
         const itemPromises = module.module_items.map(async (item) => {
+          if (item.content_type === "assignment") {
+            if (item.content_id) {
+              result.assignmentKeys.add(`id:${item.content_id}`);
+            }
+            if (item.content_data && item.content_data.due_at) {
+              result.assignmentKeys.add(
+                getAssignmentKey(item.title, item.content_data.due_at),
+              );
+            }
+          }
+
           // content_data가 없거나 마감기한이 없으면 null 반환
           if (!item.content_data || !item.content_data.due_at) {
             return null;
@@ -130,8 +174,91 @@ async function getCourseModules(courseId, courseName) {
 
     return result;
   } catch (error) {
-    return { lecture: [], assignment: [] };
+    return { lecture: [], assignment: [], assignmentKeys: new Set() };
   }
+}
+
+/**
+ * 모듈 항목과 과제를 같은 과제로 판단하기 위한 키를 만듭니다.
+ * 마감 시각은 표기 형식이 다를 수 있으므로 타임스탬프로 정규화합니다.
+ */
+function getAssignmentKey(title, dueAt) {
+  return `${(title || "").trim()}@${new Date(dueAt).getTime()}`;
+}
+
+/**
+ * 특정 과목의 "과제 및 평가" 탭 과제 중 제출하지 않은 항목을 가져옵니다.
+ */
+async function getCourseAssignmentList(courseId, courseName) {
+  const url =
+    `https://canvas.skku.edu/api/v1/courses/${courseId}/assignments` +
+    "?include[]=submission&override_assignment_dates=true&per_page=100";
+  const now = new Date();
+  const assignments = await fetchAllPages(url);
+
+  return assignments
+    .filter((assignment) => {
+      if (!assignment.due_at || getTimeGap(now, assignment.due_at) <= 0) {
+        return false;
+      }
+
+      // 아직 열리지 않았거나 이미 닫힌 과제 제외
+      if (
+        assignment.unlock_at &&
+        getTimeGap(now, assignment.unlock_at) > 0
+      ) {
+        return false;
+      }
+      if (assignment.lock_at && getTimeGap(now, assignment.lock_at) <= 0) {
+        return false;
+      }
+
+      // 제출했거나 채점/면제된 과제 제외
+      const submission = assignment.submission;
+      if (
+        submission &&
+        (submission.excused || submission.workflow_state !== "unsubmitted")
+      ) {
+        return false;
+      }
+      return true;
+    })
+    .map((assignment) => ({
+      key: getAssignmentKey(assignment.name, assignment.due_at),
+      id: `id:${assignment.id}`,
+      data: {
+        course: courseName,
+        title: assignment.name,
+        remainingTime_ms: getTimeGap(now, assignment.due_at),
+        due: assignment.due_at,
+        url:
+          assignment.html_url ||
+          `https://canvas.skku.edu/courses/${courseId}/assignments/${assignment.id}`,
+      },
+    }));
+}
+
+/**
+ * 특정 과목의 강의콘텐츠와 "과제 및 평가" 정보를 합칩니다.
+ * 두 곳에 모두 있는 과제는 강의콘텐츠(모듈) 쪽 정보를 사용합니다.
+ */
+async function getCourseToDo(courseId, courseName) {
+  const [modules, assignments] = await Promise.all([
+    getCourseModules(courseId, courseName),
+    getCourseAssignmentList(courseId, courseName),
+  ]);
+
+  const extraAssignments = assignments
+    .filter(
+      ({ key, id }) =>
+        !modules.assignmentKeys.has(key) && !modules.assignmentKeys.has(id),
+    )
+    .map(({ data }) => data);
+
+  return {
+    lecture: modules.lecture,
+    assignment: [...modules.assignment, ...extraAssignments],
+  };
 }
 
 /**
@@ -146,9 +273,9 @@ async function getAllCourseAssignments() {
       return { lecture: [], assignment: [] };
     }
 
-    // 2. 각 과목별로 모듈 정보를 병렬로 가져오고 처리
+    // 2. 각 과목별로 강의콘텐츠와 과제 및 평가 정보를 병렬로 가져오고 처리
     const modulePromises = courses.map((course) =>
-      getCourseModules(course.id, course.name),
+      getCourseToDo(course.id, course.name),
     );
 
     // Promise.allSettled로 일부 실패해도 계속 진행

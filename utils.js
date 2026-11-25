@@ -70,6 +70,19 @@ function replaceUnderbar(str) {
 }
 
 /**
+ * HTML 특수문자를 이스케이프합니다.
+ */
+function escapeHtml(str) {
+  if (typeof str !== "string") return "";
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/**
  * 항목을 남은 시간 순으로 정렬합니다.
  */
 function sortByRemainingTime(items) {
@@ -99,6 +112,7 @@ if (typeof window !== "undefined") {
     dayOfWeek,
     addSpace,
     replaceUnderbar,
+    escapeHtml,
     sortByRemainingTime,
     getUrgencyClass,
   };

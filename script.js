@@ -1,4 +1,9 @@
 /**
+ * 현재 화면에 렌더링된 할 일 목록 (클릭 시 URL 조회에 사용)
+ */
+let currentToDoList = { lecture: [], assignment: [] };
+
+/**
  * HTML DOM이 로드된 후 실행
  */
 document.addEventListener("DOMContentLoaded", function () {
@@ -17,7 +22,32 @@ document.addEventListener("DOMContentLoaded", function () {
   document
     .getElementById("refresh-button")
     .addEventListener("click", refreshData);
+
+  // 항목 클릭 이벤트 위임 (컨테이너는 유지되므로 한 번만 등록)
+  document
+    .querySelector("#lecture")
+    .addEventListener("click", (e) => handleItemClick(e, "lecture"));
+  document
+    .querySelector("#assignment")
+    .addEventListener("click", (e) => handleItemClick(e, "assignment"));
 });
+
+/**
+ * 지정한 시간 안에 끝나지 않으면 TimeoutError로 거부되는 Promise를 반환합니다.
+ */
+function withTimeout(promise, ms) {
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      const error = new Error("요청 시간 초과");
+      error.name = "TimeoutError";
+      reject(error);
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() =>
+    clearTimeout(timeoutId),
+  );
+}
 
 /**
  * 시스템 다크모드 감지 및 적용
@@ -267,37 +297,35 @@ async function refreshDataInBackground(tabId) {
  */
 async function generateToken(tabId) {
   try {
-    // AbortController로 요청 중단 기능 추가
-    const controller = new AbortController();
-    const signal = controller.signal;
+    // 과목 데이터를 가져와서 새 탭 열기 (5초 후 자동 중단)
+    const coursesResult = await withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId },
+        func: async () => {
+          try {
+            const response = await fetch(
+              "https://canvas.skku.edu/api/v1/courses",
+              {
+                method: "GET",
+                credentials: "include",
+                signal: AbortSignal.timeout(5000),
+              },
+            );
 
-    // 5초 후 자동 중단
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
-
-    // 과목 데이터를 가져와서 새 탭 열기
-    const coursesResult = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: async () => {
-        try {
-          const response = await fetch(
-            "https://canvas.skku.edu/api/v1/courses",
-            {
-              method: "GET",
-              credentials: "include",
-            },
-          );
-
-          if (response.ok) {
-            return await response.json();
+            if (response.ok) {
+              // Canvas API의 JSON 하이재킹 방지 접두사 제거
+              const text = await response.text();
+              return JSON.parse(text.replace(/^while\(1\);/, ""));
+            }
+            return null;
+          } catch (error) {
+            return null;
           }
-          return null;
-        } catch (error) {
-          return null;
-        }
-      },
-    });
+        },
+      }),
+      5000,
+    );
 
-    clearTimeout(timeoutId);
     const courses = coursesResult[0].result;
 
     if (courses && courses.length > 0) {
@@ -334,7 +362,7 @@ async function generateToken(tabId) {
       showError("과목 데이터를 가져오지 못했습니다. 다시 시도해주세요.");
     }
   } catch (error) {
-    if (error.name === "AbortError") {
+    if (error.name === "TimeoutError") {
       showError(
         "요청 시간이 초과되었습니다. 네트워크 연결을 확인하고 다시 시도해주세요.",
       );
@@ -391,20 +419,15 @@ async function getLearnStatus(tabId) {
   try {
     showLoading("학습 데이터를 가져오는 중입니다...", "Canvas API 요청 중...");
 
-    // AbortController로 요청 중단 기능 추가
-    const controller = new AbortController();
-    const signal = controller.signal;
+    // executescript.js 실행 (15초 후 자동 중단)
+    const results = await withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId },
+        files: ["executescript.js"],
+      }),
+      15000,
+    );
 
-    // 15초 후 자동 중단
-    const timeoutId = setTimeout(() => controller.abort(), 15000);
-
-    // executescript.js 실행
-    const results = await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["executescript.js"],
-    });
-
-    clearTimeout(timeoutId);
     const result = results[0].result;
 
     if (result) {
@@ -420,7 +443,7 @@ async function getLearnStatus(tabId) {
       showError("데이터를 불러오지 못했습니다. 새로고침 후 다시 시도해주세요.");
     }
   } catch (error) {
-    if (error.name === "AbortError") {
+    if (error.name === "TimeoutError") {
       showError(
         "데이터 로드 시간이 초과되었습니다. 네트워크 연결을 확인하고 다시 시도해주세요.",
       );
@@ -458,9 +481,33 @@ function updateCountBadges(data) {
 }
 
 /**
- * 할 일 목록을 렌더링하고 이벤트 리스너를 추가합니다.
+ * 남은 시간을 현재 시각 기준으로 다시 계산하고, 마감된 항목을 제외한 뒤 정렬합니다.
+ * 캐시된 데이터의 남은 시간은 저장 시점 기준이므로 렌더링 전에 반드시 호출합니다.
  */
-function renderToDoList(thingsToDo) {
+function refreshRemainingTime(thingsToDo) {
+  const now = new Date();
+  const update = (items) =>
+    sortByRemainingTime(
+      (items || [])
+        .map((item) => ({
+          ...item,
+          remainingTime_ms: getTimeGap(now, item.due),
+        }))
+        .filter((item) => item.remainingTime_ms > 0),
+    );
+
+  return {
+    lecture: update(thingsToDo.lecture),
+    assignment: update(thingsToDo.assignment),
+  };
+}
+
+/**
+ * 할 일 목록을 렌더링합니다.
+ */
+function renderToDoList(data) {
+  const thingsToDo = refreshRemainingTime(data);
+
   // 성능을 위해 DocumentFragment 사용
   const lectureFragment = document.createDocumentFragment();
   const assignmentFragment = document.createDocumentFragment();
@@ -496,38 +543,24 @@ function renderToDoList(thingsToDo) {
     assignmentContainer.innerHTML = "";
     assignmentContainer.appendChild(assignmentFragment);
 
+    // 클릭 시 화면과 같은 인덱스로 조회하도록 렌더링과 동시에 갱신
+    currentToDoList = thingsToDo;
+
     // 카운트 업데이트
     updateCountBadges(thingsToDo);
-
-    // 이벤트 위임 적용
-    setupEventDelegation(thingsToDo);
-  });
-}
-
-/**
- * 이벤트 위임 설정
- */
-function setupEventDelegation(thingsToDo) {
-  // 강의 테이블 이벤트
-  document.querySelector("#lecture").addEventListener("click", (e) => {
-    handleItemClick(e, thingsToDo.lecture, "lecture");
-  });
-
-  // 과제 테이블 이벤트
-  document.querySelector("#assignment").addEventListener("click", (e) => {
-    handleItemClick(e, thingsToDo.assignment, "assignment");
   });
 }
 
 /**
  * 클릭 이벤트 처리
  */
-function handleItemClick(e, items, type) {
+function handleItemClick(e, type) {
   const titleElement = e.target.closest(".title");
   if (!titleElement) return;
 
   const id = titleElement.id;
   const index = parseInt(id.replace(type, ""));
+  const items = currentToDoList[type];
 
   if (items[index]) {
     chrome.tabs.create({ url: items[index].url, active: true });
@@ -567,8 +600,8 @@ function generateTableHTML(data, caption, type) {
       const timeDisplay = msToTime(item.remainingTime_ms);
 
       return `<tr${rowClass}>
-      <td>${replaceUnderbar(item.course)}</td>
-      <td class="title" id="${type}${i}">${replaceUnderbar(item.title)}</td>
+      <td>${escapeHtml(replaceUnderbar(item.course))}</td>
+      <td class="title" id="${type}${i}">${escapeHtml(replaceUnderbar(item.title))}</td>
       <td>${dateToLocaleString(item.due)}</td>
       <td${urgencyClassAttr}>${timeDisplay}</td>
     </tr>`;
